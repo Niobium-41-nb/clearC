@@ -66,6 +66,7 @@ struct CacheEntry {
     wchar_t path[MAX_PATH];
     ULONGLONG size;
     bool exists;
+    int lvIndex;  // ListView 中的索引，-1 表示不显示
 };
 
 // ─── 全局状态 ───
@@ -184,6 +185,7 @@ static void AddEntry(const wchar_t* name, const std::wstring& path) {
     e.path[MAX_PATH - 1] = 0;
     e.size = 0;
     e.exists = false;
+    e.lvIndex = -1;
 }
 
 static void InitEntries() {
@@ -226,22 +228,29 @@ static void InitEntries() {
 // ════════════════════════════════════════
 
 static DWORD WINAPI ScanThread(LPVOID) {
+    // 计算存在的项数
+    int existCount = 0;
+    for (int i = 0; i < g_count; i++)
+        if (g_entries[i].lvIndex >= 0) existCount++;
+
+    int scanned = 0;
     for (int i = 0; i < g_count; i++) {
         if (!g_scanning) return 0;
+        if (g_entries[i].lvIndex < 0) continue;  // 跳过不存在的项目
 
         std::wstring path(g_entries[i].path);
-        bool exists = IsDir(path.c_str());
-        ULONGLONG size = exists ? CalcDirSize(path) : 0;
+        ULONGLONG size = CalcDirSize(path);
 
         {
             std::lock_guard<std::mutex> lk(g_mtx);
-            g_entries[i].exists = exists;
+            g_entries[i].exists = true;
             g_entries[i].size = size;
         }
 
         PostMessage(g_hWnd, WM_SCAN_UPDATE, (WPARAM)i, 0);
+        scanned++;
         PostMessage(g_hWnd, WM_SCAN_PROGRESS,
-                    (WPARAM)((i + 1) * 100 / g_count), 0);
+                    (WPARAM)(scanned * 100 / existCount), 0);
     }
     PostMessage(g_hWnd, WM_SCAN_DONE, 0, 0);
     return 0;
@@ -252,20 +261,30 @@ static DWORD WINAPI ScanThread(LPVOID) {
 // ════════════════════════════════════════
 
 static DWORD WINAPI CleanThread(LPVOID) {
-    std::vector<int> sel;
-    for (int i = 0; i < g_count; i++)
-        if (ListView_GetCheckState(g_hListView, i))
-            sel.push_back(i);
+    // 收集 ListView 中选中的项（通过 lvIndex 映射回 g_entries）
+    std::vector<int> selEntryIdx;
+    int lvCount = ListView_GetItemCount(g_hListView);
+    for (int lv = 0; lv < lvCount; lv++) {
+        if (ListView_GetCheckState(g_hListView, lv)) {
+            // 找到对应的 g_entries 索引
+            for (int i = 0; i < g_count; i++) {
+                if (g_entries[i].lvIndex == lv) {
+                    selEntryIdx.push_back(i);
+                    break;
+                }
+            }
+        }
+    }
 
-    if (sel.empty()) {
+    if (selEntryIdx.empty()) {
         PostMessage(g_hWnd, WM_CLEAN_DONE, 0, 0);
         return 0;
     }
 
-    int total = (int)sel.size();
+    int total = (int)selEntryIdx.size();
     for (int k = 0; k < total; k++) {
         if (!g_cleaning) return 0;
-        int i = sel[k];
+        int i = selEntryIdx[k];
         CleanDirContents(std::wstring(g_entries[i].path));
         PostMessage(g_hWnd, WM_CLEAN_UPDATE,
                     (WPARAM)((k + 1) * 100 / total), 0);
@@ -281,9 +300,18 @@ static DWORD WINAPI CleanThread(LPVOID) {
 static ULONGLONG GetSelectedSize() {
     ULONGLONG total = 0;
     std::lock_guard<std::mutex> lk(g_mtx);
-    for (int i = 0; i < g_count; i++)
-        if (ListView_GetCheckState(g_hListView, i))
-            total += g_entries[i].size;
+    int lvCount = ListView_GetItemCount(g_hListView);
+    for (int lv = 0; lv < lvCount; lv++) {
+        if (ListView_GetCheckState(g_hListView, lv)) {
+            // 找到对应的 g_entries 索引
+            for (int i = 0; i < g_count; i++) {
+                if (g_entries[i].lvIndex == lv) {
+                    total += g_entries[i].size;
+                    break;
+                }
+            }
+        }
+    }
     return total;
 }
 
@@ -294,8 +322,9 @@ static void UpdateSelLabel() {
 }
 
 static void SetAllChecks(bool checked) {
-    for (int i = 0; i < g_count; i++)
-        ListView_SetCheckState(g_hListView, i, checked ? TRUE : FALSE);
+    int lvCount = ListView_GetItemCount(g_hListView);
+    for (int lv = 0; lv < lvCount; lv++)
+        ListView_SetCheckState(g_hListView, lv, checked ? TRUE : FALSE);
     SendMessage(g_hBtnAll, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
     UpdateSelLabel();
 }
@@ -309,14 +338,23 @@ static void DoScan() {
     SendMessage(g_hProgress, PBM_SETPOS, 0, 0);
 
     ListView_DeleteAllItems(g_hListView);
+    int lvIdx = 0;
     for (int i = 0; i < g_count; i++) {
+        // 只添加存在的缓存项
+        if (!IsDir(g_entries[i].path)) {
+            g_entries[i].lvIndex = -1;
+            continue;
+        }
+
+        g_entries[i].lvIndex = lvIdx;
         LVITEMW item = {};
         item.mask = LVIF_TEXT;
-        item.iItem = i;
+        item.iItem = lvIdx;
         item.pszText = g_entries[i].name;
         ListView_InsertItem(g_hListView, &item);
-        ListView_SetItemText(g_hListView, i, 1, (LPWSTR)L"扫描中...");
-        ListView_SetItemText(g_hListView, i, 2, (LPWSTR)g_entries[i].path);
+        ListView_SetItemText(g_hListView, lvIdx, 1, (LPWSTR)L"扫描中...");
+        ListView_SetItemText(g_hListView, lvIdx, 2, (LPWSTR)g_entries[i].path);
+        lvIdx++;
     }
 
     CreateThread(nullptr, 0, ScanThread, nullptr, 0, nullptr);
@@ -486,11 +524,12 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (nmlv->uChanged & LVIF_STATE) {
                 UpdateSelLabel();
                 // 同步全选复选框状态
+                int lvCount = ListView_GetItemCount(g_hListView);
                 int checkedCount = 0;
-                for (int i = 0; i < g_count; i++)
-                    if (ListView_GetCheckState(g_hListView, i))
+                for (int lv = 0; lv < lvCount; lv++)
+                    if (ListView_GetCheckState(g_hListView, lv))
                         checkedCount++;
-                bool allChecked = (checkedCount == g_count && g_count > 0);
+                bool allChecked = (checkedCount == lvCount && lvCount > 0);
                 bool noneChecked = (checkedCount == 0);
                 SendMessage(g_hBtnAll, BM_SETCHECK,
                     allChecked ? BST_CHECKED : (noneChecked ? BST_UNCHECKED : BST_INDETERMINATE), 0);
@@ -502,10 +541,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SCAN_UPDATE: {
         int idx = (int)wp;
         std::lock_guard<std::mutex> lk(g_mtx);
-        if (idx >= 0 && idx < g_count) {
-            std::wstring s = g_entries[idx].exists
-                ? FormatSize(g_entries[idx].size) : L"(不存在)";
-            ListView_SetItemText(g_hListView, idx, 1, (LPWSTR)s.c_str());
+        if (idx >= 0 && idx < g_count && g_entries[idx].lvIndex >= 0) {
+            std::wstring s = FormatSize(g_entries[idx].size);
+            ListView_SetItemText(g_hListView, g_entries[idx].lvIndex, 1, (LPWSTR)s.c_str());
         }
         return 0;
     }
