@@ -23,6 +23,8 @@
 #include <shlobj.h>
 #include <shlwapi.h>
 
+#include "resource.h"
+
 #include <string>
 #include <vector>
 #include <atomic>
@@ -85,8 +87,17 @@ static HWND g_hBtnNone   = nullptr;
 static HWND g_hProgress  = nullptr;
 static HWND g_hStatus    = nullptr;
 static HWND g_hSelLabel  = nullptr;
+static HWND g_hLogo      = nullptr;
+static HWND g_hBrand     = nullptr;
 static HFONT g_hFont     = nullptr;
 static HFONT g_hFontBold = nullptr;
+static HICON g_hIcon     = nullptr;
+static HICON g_hIconSm   = nullptr;
+
+// ─── 顶栏品牌标识尺寸 ───
+static constexpr int BRAND_ICON = 24;
+static constexpr int BRAND_TEXT_W = 56;
+static constexpr int BRAND_GAP = 8;
 
 // ════════════════════════════════════════
 //  工具函数
@@ -394,6 +405,10 @@ static void LayoutControls(int w, int h) {
     int lvBottom = h - 110;
     MoveWindow(g_hListView, 10, 48, w - 20, lvBottom - 48, TRUE);
 
+    int textX = w - 10 - BRAND_TEXT_W;
+    MoveWindow(g_hBrand, textX, 12, BRAND_TEXT_W, BRAND_ICON, TRUE);
+    MoveWindow(g_hLogo, textX - BRAND_GAP - BRAND_ICON, 12, BRAND_ICON, BRAND_ICON, TRUE);
+
     int infoY = lvBottom + 2;
     MoveWindow(g_hSelLabel, 12, infoY, 200, 20, TRUE);
     MoveWindow(g_hStatus, 220, infoY, w - 230, 20, TRUE);
@@ -426,6 +441,17 @@ static void CreateControls(HWND hWnd) {
     g_hBtnAll = CreateWindowW(L"BUTTON", L"全选",
         WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
         110, 10, 55, 28, hWnd, (HMENU)(INT_PTR)ID_BTN_ALL, nullptr, nullptr);
+
+    // ── 品牌标识 ──
+    int textX = w - 10 - BRAND_TEXT_W;
+    g_hBrand = CreateWindowW(L"STATIC", L"clearC",
+        WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_CENTERIMAGE,
+        textX, 12, BRAND_TEXT_W, BRAND_ICON, hWnd, nullptr, nullptr, nullptr);
+
+    g_hLogo = CreateWindowW(L"STATIC", nullptr,
+        WS_CHILD | WS_VISIBLE | SS_ICON,
+        textX - BRAND_GAP - BRAND_ICON, 12, BRAND_ICON, BRAND_ICON, hWnd, nullptr, nullptr, nullptr);
+    SendMessageW(g_hLogo, STM_SETICON, (WPARAM)g_hIcon, TRUE);
 
     // ── ListView ──
     g_hListView = CreateWindowW(WC_LISTVIEWW, L"",
@@ -482,6 +508,7 @@ static void CreateControls(HWND hWnd) {
         SendMessageW(c, WM_SETFONT, (WPARAM)g_hFont, TRUE);
     SendMessageW(g_hBtnScan, WM_SETFONT, (WPARAM)g_hFontBold, TRUE);
     SendMessageW(g_hBtnClean, WM_SETFONT, (WPARAM)g_hFontBold, TRUE);
+    SendMessageW(g_hBrand, WM_SETFONT, (WPARAM)g_hFontBold, TRUE);
 }
 
 // ════════════════════════════════════════
@@ -596,6 +623,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
 
     InitEntries();
 
+    // 用 SM_CX*ICON 而非固定 32/16，高 DPI 下才能取到 ICO 里对应的尺寸而不是被拉伸
+    g_hIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON,
+                    GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR);
+    g_hIconSm = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON,
+                    GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
+
     const wchar_t* CLS = L"ClearCWnd";
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
@@ -605,8 +638,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wc.lpszClassName = CLS;
-    wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-    wc.hIconSm = LoadIcon(nullptr, IDI_APPLICATION);
+    wc.hIcon = g_hIcon;
+    wc.hIconSm = g_hIconSm;
     RegisterClassExW(&wc);
 
     int sx = GetSystemMetrics(SM_CXSCREEN);
@@ -630,5 +663,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
+    if (g_hIcon) DestroyIcon(g_hIcon);
+    if (g_hIconSm) DestroyIcon(g_hIconSm);
     return (int)msg.wParam;
 }

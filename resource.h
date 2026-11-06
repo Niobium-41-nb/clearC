@@ -1,0 +1,6 @@
+#ifndef CLEARC_RESOURCE_H
+#define CLEARC_RESOURCE_H
+
+#define IDI_APPICON 101
+
+#endif

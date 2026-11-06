@@ -10,6 +10,9 @@
 *.suo
 *.user
 
+# Python
+__pycache__/
+
 # OS
 Thumbs.db
 .DS_Store

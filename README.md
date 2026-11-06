@@ -1,3 +1,5 @@
+<img src="assets/logo.png" width="88" alt="clearC logo" />
+
 # clearC - C盘缓存清理工具
 
 Windows 原生桌面应用，一键清理 C 盘各类缓存，释放磁盘空间。
@@ -48,6 +50,20 @@ cl /std:c++17 /O2 clearC.cpp resource.res /link ^
 - Win32 API
 - Common Controls v6
 - 静态链接，无外部依赖
+
+## 图标与标识
+
+| 文件 | 用途 |
+| --- | --- |
+| `assets/logo.svg` | 矢量母版 |
+| `assets/logo.png` | 位图标识（文档、宣传用） |
+| `assets/clearC.ico` | 程序图标（16–256px 多尺寸），由 `resource.rc` 嵌入 exe |
+
+标识由脚本生成，改 `tools/gen_logo.py` 顶部的设计参数后重跑即可（需要 Python + Pillow）：
+
+```bash
+python tools/gen_logo.py
+```
 
 ## 许可证
 
