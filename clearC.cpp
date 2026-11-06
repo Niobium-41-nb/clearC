@@ -29,6 +29,7 @@
 #include <vector>
 #include <atomic>
 #include <mutex>
+#include <algorithm>
 #include <cstdio>
 
 #if defined(_MSC_VER)
@@ -62,6 +63,12 @@ static constexpr int WIN_W = 760;
 static constexpr int WIN_H = 540;
 static constexpr int MAX_ENTRIES = 32;
 
+// 字号可调；其余控件尺寸都按 FONT_BASE 等比放大
+static constexpr int FONT_BASE = 13;
+static constexpr int FONT_MIN = 11;
+static constexpr int FONT_MAX = 26;
+static constexpr int MAX_SUBCLASS = 16;
+
 // ─── 缓存项 ───
 struct CacheEntry {
     wchar_t name[128];
@@ -93,6 +100,13 @@ static HFONT g_hFont     = nullptr;
 static HFONT g_hFontBold = nullptr;
 static HICON g_hIcon     = nullptr;
 static HICON g_hIconSm   = nullptr;
+static int g_fontPx      = FONT_BASE;
+static int g_wheelAccum  = 0;   // 累积不足一个字号的滚轮增量
+
+// WM_MOUSEWHEEL 不会向父窗口冒泡，子类化子控件把 Ctrl+滚轮转出去
+static HWND g_subWnd[MAX_SUBCLASS];
+static WNDPROC g_subProc[MAX_SUBCLASS];
+static int g_subCount = 0;
 
 // ─── 顶栏品牌标识尺寸 ───
 static constexpr int BRAND_ICON = 24;
@@ -308,6 +322,45 @@ static DWORD WINAPI CleanThread(LPVOID) {
 //  UI 辅助
 // ════════════════════════════════════════
 
+// 把 FONT_BASE 下的设计尺寸换算成当前字号下的尺寸
+static int S(int v) { return MulDiv(v, g_fontPx, FONT_BASE); }
+
+static LRESULT CALLBACK WheelForwardProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_MOUSEWHEEL && (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL))
+        return SendMessageW(GetParent(hWnd), WM_MOUSEWHEEL, wp, lp);
+    for (int i = 0; i < g_subCount; i++)
+        if (g_subWnd[i] == hWnd)
+            return CallWindowProcW(g_subProc[i], hWnd, msg, wp, lp);
+    return DefWindowProcW(hWnd, msg, wp, lp);
+}
+
+static void SubclassForWheel(HWND hWnd) {
+    if (g_subCount >= MAX_SUBCLASS) return;
+    g_subWnd[g_subCount]  = hWnd;
+    g_subProc[g_subCount] = (WNDPROC)(LONG_PTR)GetWindowLongPtrW(hWnd, GWLP_WNDPROC);
+    SetWindowLongPtrW(hWnd, GWLP_WNDPROC, (LONG_PTR)WheelForwardProc);
+    g_subCount++;
+}
+
+static void ApplyFonts() {
+    if (g_hFont) DeleteObject(g_hFont);
+    if (g_hFontBold) DeleteObject(g_hFontBold);
+
+    g_hFont = CreateFontW(-g_fontPx, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+    g_hFontBold = CreateFontW(-g_fontPx, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+
+    HWND normal[] = { g_hListView, g_hBtnAll, g_hSelLabel, g_hStatus };
+    for (auto c : normal)
+        SendMessageW(c, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+    HWND bold[] = { g_hBtnScan, g_hBtnClean, g_hBrand };
+    for (auto c : bold)
+        SendMessageW(c, WM_SETFONT, (WPARAM)g_hFontBold, TRUE);
+}
+
 static ULONGLONG GetSelectedSize() {
     ULONGLONG total = 0;
     std::lock_guard<std::mutex> lk(g_mtx);
@@ -402,22 +455,32 @@ static void DoClean() {
 // ════════════════════════════════════════
 
 static void LayoutControls(int w, int h) {
-    int lvBottom = h - 110;
-    MoveWindow(g_hListView, 10, 48, w - 20, lvBottom - 48, TRUE);
+    int lvTop = S(48);
+    int lvBottom = h - S(110);
 
-    int textX = w - 10 - BRAND_TEXT_W;
-    MoveWindow(g_hBrand, textX, 12, BRAND_TEXT_W, BRAND_ICON, TRUE);
-    MoveWindow(g_hLogo, textX - BRAND_GAP - BRAND_ICON, 12, BRAND_ICON, BRAND_ICON, TRUE);
+    int btnH = S(28);
+    MoveWindow(g_hBtnScan, S(10), S(10), S(90), btnH, TRUE);
+    MoveWindow(g_hBtnAll, S(110), S(10), S(55), btnH, TRUE);
 
-    int infoY = lvBottom + 2;
-    MoveWindow(g_hSelLabel, 12, infoY, 200, 20, TRUE);
-    MoveWindow(g_hStatus, 220, infoY, w - 230, 20, TRUE);
-    MoveWindow(g_hProgress, 10, infoY + 24, w - 20, 18, TRUE);
-    MoveWindow(g_hBtnClean, w / 2 - 55, infoY + 48, 110, 32, TRUE);
+    MoveWindow(g_hListView, S(10), lvTop, w - S(20), lvBottom - lvTop, TRUE);
+
+    int textX = w - S(10) - S(BRAND_TEXT_W);
+    MoveWindow(g_hBrand, textX, S(12), S(BRAND_TEXT_W), S(BRAND_ICON), TRUE);
+    MoveWindow(g_hLogo, textX - S(BRAND_GAP) - S(BRAND_ICON), S(12), S(BRAND_ICON), S(BRAND_ICON), TRUE);
+
+    int infoY = lvBottom + S(2);
+    MoveWindow(g_hSelLabel, S(12), infoY, S(200), S(20), TRUE);
+    MoveWindow(g_hStatus, S(220), infoY, w - S(230), S(20), TRUE);
+    MoveWindow(g_hProgress, S(10), infoY + S(24), w - S(20), S(18), TRUE);
+    MoveWindow(g_hBtnClean, w / 2 - S(55), infoY + S(48), S(110), S(32), TRUE);
 
     LVCOLUMNW col = {};
     col.mask = LVCF_WIDTH;
-    col.cx = w - 350;
+    col.cx = S(200);
+    ListView_SetColumn(g_hListView, 0, &col);
+    col.cx = S(100);
+    ListView_SetColumn(g_hListView, 1, &col);
+    col.cx = w - S(350);
     ListView_SetColumn(g_hListView, 2, &col);
 }
 
@@ -426,37 +489,31 @@ static void CreateControls(HWND hWnd) {
     GetClientRect(hWnd, &rc);
     int w = rc.right;
 
-    g_hFont = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
-    g_hFontBold = CreateFontW(-13, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
-
     // ── 工具栏按钮 ──
     g_hBtnScan = CreateWindowW(L"BUTTON", L"扫描缓存",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        10, 10, 90, 28, hWnd, (HMENU)(INT_PTR)ID_BTN_SCAN, nullptr, nullptr);
+        S(10), S(10), S(90), S(28), hWnd, (HMENU)(INT_PTR)ID_BTN_SCAN, nullptr, nullptr);
 
     g_hBtnAll = CreateWindowW(L"BUTTON", L"全选",
         WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-        110, 10, 55, 28, hWnd, (HMENU)(INT_PTR)ID_BTN_ALL, nullptr, nullptr);
+        S(110), S(10), S(55), S(28), hWnd, (HMENU)(INT_PTR)ID_BTN_ALL, nullptr, nullptr);
 
     // ── 品牌标识 ──
-    int textX = w - 10 - BRAND_TEXT_W;
+    int textX = w - S(10) - S(BRAND_TEXT_W);
     g_hBrand = CreateWindowW(L"STATIC", L"clearC",
         WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_CENTERIMAGE,
-        textX, 12, BRAND_TEXT_W, BRAND_ICON, hWnd, nullptr, nullptr, nullptr);
+        textX, S(12), S(BRAND_TEXT_W), S(BRAND_ICON), hWnd, nullptr, nullptr, nullptr);
 
     g_hLogo = CreateWindowW(L"STATIC", nullptr,
         WS_CHILD | WS_VISIBLE | SS_ICON,
-        textX - BRAND_GAP - BRAND_ICON, 12, BRAND_ICON, BRAND_ICON, hWnd, nullptr, nullptr, nullptr);
+        textX - S(BRAND_GAP) - S(BRAND_ICON), S(12), S(BRAND_ICON), S(BRAND_ICON),
+        hWnd, nullptr, nullptr, nullptr);
     SendMessageW(g_hLogo, STM_SETICON, (WPARAM)g_hIcon, TRUE);
 
     // ── ListView ──
     g_hListView = CreateWindowW(WC_LISTVIEWW, L"",
         WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SHOWSELALWAYS,
-        10, 48, w - 20, 340, hWnd, (HMENU)(INT_PTR)ID_LISTVIEW, nullptr, nullptr);
+        S(10), S(48), w - S(20), S(340), hWnd, (HMENU)(INT_PTR)ID_LISTVIEW, nullptr, nullptr);
 
     ListView_SetExtendedListViewStyle(g_hListView,
         LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
@@ -465,50 +522,48 @@ static void CreateControls(HWND hWnd) {
     col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
 
     col.pszText = (LPWSTR)L"缓存项";
-    col.cx = 200;
+    col.cx = S(200);
     col.iSubItem = 0;
     ListView_InsertColumn(g_hListView, 0, &col);
 
     col.pszText = (LPWSTR)L"大小";
-    col.cx = 100;
+    col.cx = S(100);
     col.iSubItem = 1;
     ListView_InsertColumn(g_hListView, 1, &col);
 
     col.pszText = (LPWSTR)L"路径";
-    col.cx = w - 350;
+    col.cx = w - S(350);
     col.iSubItem = 2;
     ListView_InsertColumn(g_hListView, 2, &col);
 
     // ── 信息行 ──
     g_hSelLabel = CreateWindowW(L"STATIC", L"已选择: 0 B",
         WS_CHILD | WS_VISIBLE | SS_LEFT,
-        12, 395, 200, 20, hWnd, (HMENU)(INT_PTR)ID_SEL_LABEL, nullptr, nullptr);
+        S(12), S(395), S(200), S(20), hWnd, (HMENU)(INT_PTR)ID_SEL_LABEL, nullptr, nullptr);
 
     g_hStatus = CreateWindowW(L"STATIC", L"就绪 - 点击「扫描缓存」开始",
         WS_CHILD | WS_VISIBLE | SS_RIGHT,
-        220, 395, w - 230, 20, hWnd, (HMENU)(INT_PTR)ID_STATUS, nullptr, nullptr);
+        S(220), S(395), w - S(230), S(20), hWnd, (HMENU)(INT_PTR)ID_STATUS, nullptr, nullptr);
 
     // ── 进度条 ──
     g_hProgress = CreateWindowW(PROGRESS_CLASSW, L"",
         WS_CHILD | WS_VISIBLE,
-        10, 420, w - 20, 18, hWnd, (HMENU)(INT_PTR)ID_PROGRESS, nullptr, nullptr);
+        S(10), S(420), w - S(20), S(18), hWnd, (HMENU)(INT_PTR)ID_PROGRESS, nullptr, nullptr);
 
     // ── 清理按钮 ──
     g_hBtnClean = CreateWindowW(L"BUTTON", L"清理选中项",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        w / 2 - 55, 448, 110, 32, hWnd, (HMENU)(INT_PTR)ID_BTN_CLEAN, nullptr, nullptr);
+        w / 2 - S(55), S(448), S(110), S(32), hWnd, (HMENU)(INT_PTR)ID_BTN_CLEAN, nullptr, nullptr);
     EnableWindow(g_hBtnClean, FALSE);
 
-    // ── 设置字体 ──
-    HWND ctrls[] = {
-        g_hBtnScan, g_hBtnAll, g_hBtnClean,
-        g_hSelLabel, g_hStatus
+    ApplyFonts();
+
+    // ── 子类化，使 Ctrl+滚轮在窗口任意位置都生效 ──
+    HWND sub[] = {
+        g_hBtnScan, g_hBtnAll, g_hBtnClean, g_hListView,
+        g_hSelLabel, g_hStatus, g_hProgress, g_hLogo, g_hBrand
     };
-    for (auto c : ctrls)
-        SendMessageW(c, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-    SendMessageW(g_hBtnScan, WM_SETFONT, (WPARAM)g_hFontBold, TRUE);
-    SendMessageW(g_hBtnClean, WM_SETFONT, (WPARAM)g_hFontBold, TRUE);
-    SendMessageW(g_hBrand, WM_SETFONT, (WPARAM)g_hFontBold, TRUE);
+    for (auto c : sub) SubclassForWheel(c);
 }
 
 // ════════════════════════════════════════
@@ -524,6 +579,29 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SIZE:
         LayoutControls(LOWORD(lp), HIWORD(lp));
         return 0;
+
+    case WM_MOUSEWHEEL:
+        if (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL) {
+            // 按 WHEEL_DELTA 累计：一次 360 的大增量算 3 档，平滑滚轮的零头留到下一格
+            g_wheelAccum += GET_WHEEL_DELTA_WPARAM(wp);
+            int steps = g_wheelAccum / WHEEL_DELTA;
+            if (steps != 0) {
+                g_wheelAccum -= steps * WHEEL_DELTA;
+                int next = std::clamp(g_fontPx + steps, FONT_MIN, FONT_MAX);
+                if (next != g_fontPx) {
+                    g_fontPx = next;
+                    ApplyFonts();
+                    RECT rc;
+                    GetClientRect(hWnd, &rc);
+                    LayoutControls(rc.right - rc.left, rc.bottom - rc.top);
+                    wchar_t buf[48];
+                    swprintf(buf, 48, L"字号 %d px", g_fontPx);
+                    SetWindowTextW(g_hStatus, buf);
+                }
+            }
+            return 0;
+        }
+        break;
 
     case WM_CTLCOLORSTATIC: {
         HDC hdc = (HDC)wp;
