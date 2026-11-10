@@ -1,8 +1,12 @@
 # Build artifacts
+build/
 *.exe
 *.o
 *.obj
 *.res
+*.pdb
+*.ilk
+*.log
 
 # IDE
 .vscode/
