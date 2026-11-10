@@ -119,6 +119,7 @@ build.bat         一键编译脚本
 
 - [docs/audit.md](docs/audit.md)：旧实现审计（junction 跟随、MAX_PATH 截断、失败吞掉、构建脚本误报等），含可执行复现与验收清单。
 - [docs/cache-candidates.md](docs/cache-candidates.md)：本机候选缓存目录实测（大小 / ACL / 风险 / 危险项 / 通配与路径陷阱）。
+- [docs/verify.md](docs/verify.md)：2.0.0 独立验收报告（构建 / CLI / GUI / 安全 / 一致性，49+2 项自检与增量复核 PASS）。
 
 ## 图标与标识
 

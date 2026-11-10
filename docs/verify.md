@@ -210,3 +210,61 @@ victim\IMPORTANT.txt 仍存在                         // 仅扫描，未删除�
 | `-Wall -Wextra` 完整编译对象 | `%TEMP%\clearc-obj\*.o` |
 
 以上均为临时证据；仓库内唯一新增文件为本报告。
+
+## 7. 增量复核（提交 912a8f9）
+
+- 复核时间：2026-11-10 11:49–11:56（UTC+8）
+- 基线：`912a8f9`（`refactor: clearC 2.0.0 模块化重构、97 项清理目录与安全护栏`，23 files, +4778/−807）
+- 复核范围：针对本报告 §4 两条低危建议的加固——(1) `IsSafeToClean` 拒绝 UNC / 设备路径；(2) `--scan` 与 GUI 增加 `skippedReparse` 可观测性；外加构建、自检、一致性回归。
+- 约束遵守：未执行真实清理；仅重建、`--scan/--list/--self-test` 与 GUI 扫描；除向本文件追加本节外未修改任何仓库文件。
+
+**增量结论：PASS。** 两条加固均按预期落地并通过实测；自检 51/51 通过；无新增阻断或回归。
+
+### 7.1 增量验收项
+
+| # | 断言 | 结果 |
+| --- | --- | --- |
+| 1 | 从非仓库 CWD（`%TEMP%`）运行 `build.bat`，退出码 0 | **PASS**（exit 0，12.3s；`Build succeeded`） |
+| 2 | 重建后 `clearC.exe` 更新且版本仍为 2.0.0.0 | **PASS**（SHA256 `502EBF51…`→`C97D5D14…`；FileVersion=2.0.0.0；大小 1,221,481 B） |
+| 3 | `--self-test` = 51 通过 / 0 失败 / 0 跳过、退出码 0 | **PASS**（`自检结果: 51 通过 / 0 失败 / 0 跳过`，exit 0） |
+| 4 | 新增 2 个自检用例存在且通过 | **PASS**（`[PASS] 安全判定: 拒绝 \\?\ 设备路径`、`[PASS] 安全判定: 拒绝 UNC 路径`） |
+| 5 | `--list --json` 仍为 97 项、7 类 | **PASS**（total=97、items=97、cats=7、kind=file=2、defaultChecked=70、needsAdmin=14） |
+| 6 | `--scan --json` 每项含 `skippedReparse`、JSON 合法 | **PASS**（缺失字段=0；64 项；含 `skippedReparse` 字段） |
+| 7 | `--scan --json` `totalBytes>0` 且逐项求和一致 | **PASS**（41,133,185,368 B ≈ 38.31 GB；sumMatch=true；扫描 9.6s） |
+| 8 | `skippedReparse` 有真实数据（非恒 0 占位） | **PASS**（3 项：pnpm 存储（v9+）=25、pnpm 元数据缓存=2、系统网络缓存（INetCache）=2） |
+| 9 | CLI 文本模式对 `skippedReparse>0` 显示 `[含链接子目录]` | **PASS**（命中 3 行，例：`pnpm 存储（v9+） 1.52 GB  [含链接子目录]`） |
+| 10 | GUI 路径列显示“（含 N 个链接已跳过）”且无回归 | **PASS**（可选复跑 GUI 夹具：RESULT=PASS、行数 64、全选半选=2、越界=0、WM_CLOSE=0；截图实测 `…\pnpm\store（含 25 个链接已跳过…`、`…\pnpm-cache（含 2 个链接已跳过）`） |
+| 11 | `-Wall -Wextra` 无警告（`-fsyntax-only` 与完整 `-c` 双检） | **PASS**（两者均 exit 0、警告 0） |
+| 12 | `git log -1` 为 `912a8f9`、`git status --short` 为空 | **PASS**（HEAD=`912a8f94e8be…`；status 空；重建后仍为空，`clearC.exe`/`build/` 被 ignore 命中） |
+| 13 | `.gitattributes` 新增 `.gitignore/.gitattributes/LICENSE eol=lf` | **PASS**（三行均存在；`*.bat eol=crlf` 保留） |
+| 14 | `build/` 临时产物已清理 | **PASS**（仅剩 `build/ui-v3.png` 290,310 B；`build/` 被 `.gitignore` 忽略、未被 git 跟踪） |
+| 15 | 源码抽查：UNC / 设备路径拒绝逻辑 | **PASS**（见 7.2） |
+
+### 7.2 代码抽查
+
+`src/util.cpp:320-343`（`IsSafeToClean` 入口加固）：
+
+```cpp
+std::wstring raw = TrimTrailingSlash(input);
+for (auto& c : raw) { if (c == L'/') c = L'\\'; }        // 统一斜杠，防 "//?/C:\..." 绕过
+if (raw.rfind(L"\\\\", 0) == 0) return false;            // 拒绝 UNC(\\server\share) 与设备路径(\\?\ / \\.\)
+if (raw.size() == 2 && raw[1] == L':') return false;     // 拒绝 "C:"
+if (raw.size() == 3 && raw[1] == L':' && raw[2] == L'\\') return false;  // 拒绝 "C:\"
+...
+std::wstring p = NormalizePath(input);
+p = StripDevicePrefix(p);
+// 归一化后必须仍是“本地盘符绝对路径”
+if (p.size() < 3 || !std::iswalpha(p[0]) || p[1] != L':' || p[2] != L'\\') return false;
+```
+
+该实现同时封堵了原残余风险的两个面：UNC 模板、`\\?\`/`\\.\` 设备前缀（含其跳过 `GetFullPathName` 归一化导致 `..` 绕过根比较的路径），并要求最终仍为 `X:\…` 本地盘符绝对路径。
+
+可观测性改动：`src/cli.cpp:257-258`（scan JSON 增加 `skippedReparse`）、`src/cli.cpp:276`（文本 `[含链接子目录]`）、`src/cli.cpp:422-423`（新增 2 条自检）、`src/ui.cpp:349-351`（列表路径列“（含 N 个链接已跳过）”）。
+
+### 7.3 说明与残余项
+
+1. 本节追加后 `git status` 将出现 `M docs/verify.md`（预期，属本次复核的唯一写入）；追加前的仓库状态为干净。
+2. `skippedReparse` 统计的是遍历/清理过程中跳过的重解析点个数（按条目累计），与目标级 `skippedLinks` 语义不同，二者在 GUI 中分别以“链接跳过”（状态栏/目标本身）和“含 N 个链接已跳过”（列表路径列，子目录）呈现，无需合并。
+3. `--list --json` 未增加 `skippedReparse`（本次未要求；其语义为“解析阶段目标状态”）。
+4. 扫描总量与上轮略有差异（38.31 GB vs 38.41 GB）属真实缓存变动，非代码问题。
+5. 原 §5 残余风险依然成立：仍未做真实“清理”破坏性验证（按约束仅扫描）；建议在干净 VM 补一次全选清理演练。
