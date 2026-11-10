@@ -157,7 +157,8 @@ int ListEntries(ConsoleOut& out, bool json) {
             if (i > 0) text += L",";
             text += L"{\"name\":" + JsonString(def.name) + L",\"category\":" +
                     JsonString(CategoryName(def.category)) + L",\"kind\":\"" + kindName(def.kind) +
-                    L"\",\"paths\":" + JsonString(def.paths) + L",\"exists\":" +
+                    L"\",\"paths\":" + JsonString(def.paths) + L",\"consequence\":" +
+                    JsonString(ConsequenceOf(def)) + L",\"exists\":" +
                     (states[i].exists ? L"true" : L"false") + L",\"defaultChecked\":" +
                     (def.defaultChecked ? L"true" : L"false") + L",\"needsAdmin\":" +
                     (def.needsAdmin ? L"true" : L"false") + L",\"resolved\":" +
@@ -201,6 +202,7 @@ int ListEntries(ConsoleOut& out, bool json) {
             out.Line(L"      链接跳过: " + std::to_wstring(states[i].skippedLinks) + L" 个目标");
         }
         out.Line(L"      说明: " + std::wstring(def.note));
+        out.Line(L"      清理后果: " + std::wstring(ConsequenceOf(def)));
     }
     return 0;
 }
@@ -426,6 +428,27 @@ int RunSelfTest(ConsoleOut& out) {
 
     runner.Check(WildcardMatch(L"Cach*", L"Cache"), L"通配匹配: Cach* -> Cache");
     runner.Check(!WildcardMatch(L"Cach*", L"Code Cache"), L"通配匹配: 不匹配无关项");
+
+    // ── 清理后果说明（点击名称时展示，必须逐项齐备）──
+    std::size_t defCount = 0;
+    const EntryDef* defs = Catalog(&defCount);
+    bool allHaveText = true;
+    bool allLongEnough = true;
+    std::wstring firstMissing;
+    for (std::size_t i = 0; i < defCount; ++i) {
+        if (!defs[i].consequence || !*defs[i].consequence) {
+            allHaveText = false;
+            if (firstMissing.empty()) firstMissing = defs[i].name;
+        }
+        if (std::wstring(ConsequenceOf(defs[i])).size() < 12) allLongEnough = false;
+    }
+    runner.Check(defCount == 97, L"清理项目录共 97 项", std::to_wstring(defCount));
+    runner.Check(allHaveText, L"每个清理项都有专属后果说明", firstMissing);
+    runner.Check(allLongEnough, L"后果说明文案长度合理（非占位符）");
+    const EntryDef probe = {L"临时条目", L"", Category::System, false, false, Risk::Caution,
+                            L"", nullptr, EntryKind::Directory};
+    runner.Check(std::wstring(ConsequenceOf(probe)).size() > 12,
+                 L"后果说明兜底: 新增条目不会显示空白窗口");
 
     // ── 夹具 ──
     wchar_t pidText[32];

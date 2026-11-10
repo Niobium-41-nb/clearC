@@ -31,6 +31,9 @@ constexpr int kDefaultWidth = 940;
 constexpr int kDefaultHeight = 660;
 constexpr int kMinWidth = 780;
 constexpr int kMinHeight = 560;
+constexpr int kInfoWidth = 580;   // 后果说明窗口客户区设计尺寸
+constexpr int kInfoHeight = 500;
+constexpr UINT kClickTimerId = 2101;  // 单击名称延时弹窗，等待可能的双击
 
 enum ControlId : int {
     ID_BTN_SCAN = 1001,
@@ -61,12 +64,15 @@ struct UiState {
 
     HFONT font = nullptr;
     HFONT fontBold = nullptr;
+    HFONT fontLink = nullptr;  // 第一列名称：下划线，提示可点击
     HICON icon = nullptr;
     HICON iconSm = nullptr;
+    HCURSOR handCursor = nullptr;
 
     int dpi = 96;
     int fontPx = kFontBase;
     int wheelAccum = 0;
+    int pendingNameRow = -1;  // 等待判定单击/双击的行号
 
     std::vector<EntryState> states;
     std::vector<int> visible;  // 列表行号 -> states 下标
@@ -161,12 +167,16 @@ void ClampWindowToWorkArea(HWND hwnd) {
 void ApplyFonts() {
     if (g.font) DeleteObject(g.font);
     if (g.fontBold) DeleteObject(g.fontBold);
+    if (g.fontLink) DeleteObject(g.fontLink);
 
     const int height = -MulDiv(g.fontPx, static_cast<int>(g.dpi), 96);
     g.font = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                          DEFAULT_PITCH, L"Microsoft YaHei UI");
     g.fontBold = CreateFontW(height, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                             DEFAULT_PITCH, L"Microsoft YaHei UI");
+    g.fontLink = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, TRUE, FALSE, DEFAULT_CHARSET,
                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                              DEFAULT_PITCH, L"Microsoft YaHei UI");
 
@@ -274,6 +284,9 @@ void RefreshStatus(const std::wstring& prefix = L"") {
 
 void PopulateList() {
     if (!g.list) return;
+    // 列表重排会让待判定的行号失效，先取消未触发的单击弹窗
+    if (g.hwnd) KillTimer(g.hwnd, kClickTimerId);
+    g.pendingNameRow = -1;
     g.populating = true;
     SendMessage(g.list, WM_SETREDRAW, FALSE, 0);
     ListView_DeleteAllItems(g.list);
@@ -539,23 +552,343 @@ void SetAllVisible(bool checked) {
     UpdateAllCheckbox();
 }
 
-void OpenEntryFolder(int entry) {
+// 返回该项可在资源管理器中打开的位置；文件通配项返回其所在目录
+bool ResolveOpenTarget(int entry, std::wstring* target) {
     const EntryDef& def = Defs()[entry];
     const EntryState& state = g.states[static_cast<std::size_t>(entry)];
-    std::wstring target;
     if (def.kind == EntryKind::FileGlob && !state.fileList.empty()) {
-        target = state.fileList.front();
-        const std::size_t separator = target.find_last_of(L"\\/");
-        if (separator != std::wstring::npos) target = target.substr(0, separator);
-    } else if (def.kind == EntryKind::Directory && !state.dirs.empty()) {
-        target = state.dirs.front();
-    } else {
+        *target = state.fileList.front();
+        const std::size_t separator = target->find_last_of(L"\\/");
+        if (separator != std::wstring::npos) *target = target->substr(0, separator);
+        return true;
+    }
+    if (def.kind == EntryKind::Directory && !state.dirs.empty()) {
+        *target = state.dirs.front();
+        return true;
+    }
+    return false;
+}
+
+void OpenEntryFolder(int entry) {
+    std::wstring target;
+    if (!ResolveOpenTarget(entry, &target)) {
         MessageBoxW(g.hwnd, L"该项没有可直接打开的本地目录。", L"提示",
                     MB_OK | MB_ICONINFORMATION);
         return;
     }
     std::wstring arguments = L"\"" + target + L"\"";
     ShellExecuteW(g.hwnd, L"open", L"explorer.exe", arguments.c_str(), nullptr, SW_SHOWNORMAL);
+}
+
+// ════════════════════════════════════════
+//  清理后果说明窗口（点击列表第一列名称打开）
+// ════════════════════════════════════════
+
+enum InfoControlId : int {
+    ID_INFO_TITLE = 1101,
+    ID_INFO_BADGE = 1102,
+    ID_INFO_BODY = 1103,
+    ID_INFO_OPEN = 1104,
+    ID_INFO_CLOSE = 1105,
+};
+
+struct InfoDialogState {
+    HWND hwnd = nullptr;
+    HWND title = nullptr;
+    HWND badge = nullptr;
+    HWND body = nullptr;
+    HWND btnOpen = nullptr;
+    HWND btnClose = nullptr;
+    HFONT font = nullptr;
+    HFONT fontBold = nullptr;
+    std::wstring titleText;
+    std::wstring badgeText;
+    std::wstring report;
+    std::wstring openTarget;
+    bool caution = false;
+    bool closed = false;
+};
+
+InfoDialogState gInfo;
+
+std::wstring BuildConsequenceReport(int entry) {
+    const EntryDef& def = Defs()[entry];
+    const EntryState& state = g.states[static_cast<std::size_t>(entry)];
+    std::wstring text;
+
+    text += L"【清理后会怎样】\r\n";
+    text += ConsequenceOf(def);
+    text += L"\r\n\r\n【当前状态】\r\n";
+    text += L"分类：" + std::wstring(CategoryName(def.category)) + L"\r\n";
+    text += std::wstring(L"风险等级：") +
+            (def.risk == Risk::Caution ? L"谨慎项（默认不勾选）" : L"安全项（默认勾选）") +
+            L"\r\n";
+    if (def.needsAdmin) {
+        text += g.elevated ? L"权限：需要管理员（当前已提权）\r\n"
+                           : L"权限：需要管理员，当前未提权，清理时会自动跳过\r\n";
+    } else {
+        text += L"权限：普通权限即可\r\n";
+    }
+    if (state.denied) {
+        text += L"占用：无法完整读取（需管理员或目录被占用）\r\n";
+    } else {
+        text += L"占用：" + FormatSize(state.bytes) + L"，" + FormatNumber(state.files) +
+                L" 个文件\r\n";
+    }
+    if (state.skippedLinks > 0) {
+        text += L"链接跳过：" + std::to_wstring(state.skippedLinks) +
+                L" 个目标本身是 junction / 符号链接，已整体跳过\r\n";
+    }
+
+    text += L"\r\n【影响范围】\r\n";
+    const std::vector<std::wstring>* targets = nullptr;
+    if (def.kind == EntryKind::FileGlob) targets = &state.fileList;
+    else if (def.kind == EntryKind::Directory) targets = &state.dirs;
+    if (!targets || targets->empty()) {
+        text += def.kind == EntryKind::RecycleBin
+                    ? L"  · C 盘回收站（通过系统 API 清空）\r\n"
+                    : L"  · 本机未找到匹配目标\r\n";
+    } else {
+        const std::size_t shown = std::min<std::size_t>(targets->size(), 6);
+        for (std::size_t i = 0; i < shown; ++i) text += L"  · " + (*targets)[i] + L"\r\n";
+        if (targets->size() > shown) {
+            text += L"  · 等共 " + std::to_wstring(targets->size()) + L" 个位置\r\n";
+        }
+    }
+
+    text += L"\r\n【清理方式与安全边界】\r\n";
+    switch (def.kind) {
+    case EntryKind::FileGlob:
+        text += L"只删除匹配到的文件本身，同目录下的其他文件不受影响；被占用的文件自动跳过。\r\n";
+        break;
+    case EntryKind::RecycleBin:
+        text += L"通过 Windows Shell API 清空 C 盘回收站，不直接删除磁盘文件；"
+                L"其他盘符不受影响。\r\n";
+        break;
+    default:
+        text += L"只清空上述目录内的内容，保留目录本身；不跟随 junction / 符号链接；"
+                L"被占用的文件自动跳过并计入失败数。\r\n";
+        break;
+    }
+    text += L"用户配置、文档、聊天记录与已安装的程序都不在清理范围内。\r\n";
+
+    text += L"\r\n【这是什么】\r\n" + std::wstring(def.note) + L"\r\n";
+    text += L"\r\n本窗口仅作说明，不会执行任何清理操作。";
+    return text;
+}
+
+void LayoutInfoDialog() {
+    if (!gInfo.hwnd) return;
+    RECT rc = {};
+    GetClientRect(gInfo.hwnd, &rc);
+    const int w = rc.right - rc.left;
+    const int h = rc.bottom - rc.top;
+    const int pad = S(18);
+    const int titleH = S(28);
+    const int badgeH = S(22);
+    const int buttonH = S(32);
+    const int buttonW = S(132);
+
+    int y = pad;
+    MoveWindow(gInfo.title, pad, y, w - 2 * pad, titleH, TRUE);
+    y += titleH + S(2);
+    MoveWindow(gInfo.badge, pad, y, w - 2 * pad, badgeH, TRUE);
+    y += badgeH + S(8);
+    const int bodyBottom = h - pad - buttonH - S(14);
+    MoveWindow(gInfo.body, pad, y, w - 2 * pad,
+               bodyBottom > y ? bodyBottom - y : S(80), TRUE);
+    const int by = h - pad - buttonH;
+    MoveWindow(gInfo.btnOpen, w - pad - buttonW * 2 - S(10), by, buttonW, buttonH, TRUE);
+    MoveWindow(gInfo.btnClose, w - pad - buttonW, by, buttonW, buttonH, TRUE);
+}
+
+void ApplyInfoFonts() {
+    if (gInfo.font) DeleteObject(gInfo.font);
+    if (gInfo.fontBold) DeleteObject(gInfo.fontBold);
+    const int height = -MulDiv(g.fontPx, static_cast<int>(g.dpi), 96);
+    gInfo.font = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                             DEFAULT_PITCH, L"Microsoft YaHei UI");
+    gInfo.fontBold = CreateFontW(height, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                 DEFAULT_PITCH, L"Microsoft YaHei UI");
+    HWND normal[] = {gInfo.badge, gInfo.body, gInfo.btnOpen, gInfo.btnClose};
+    for (HWND control : normal) {
+        if (control) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(gInfo.font), TRUE);
+    }
+    if (gInfo.title) {
+        SendMessageW(gInfo.title, WM_SETFONT, reinterpret_cast<WPARAM>(gInfo.fontBold), TRUE);
+    }
+}
+
+LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        gInfo.hwnd = hwnd;
+        const DWORD style = WS_CHILD | WS_VISIBLE;
+        gInfo.title = CreateWindowW(L"STATIC", gInfo.titleText.c_str(),
+                                    style | SS_LEFT | SS_CENTERIMAGE, 0, 0, 0, 0, hwnd,
+                                    reinterpret_cast<HMENU>(ID_INFO_TITLE), nullptr, nullptr);
+        gInfo.badge = CreateWindowW(L"STATIC", gInfo.badgeText.c_str(),
+                                    style | SS_LEFT | SS_CENTERIMAGE, 0, 0, 0, 0, hwnd,
+                                    reinterpret_cast<HMENU>(ID_INFO_BADGE), nullptr, nullptr);
+        gInfo.body = CreateWindowW(L"EDIT", nullptr,
+                                   style | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_READONLY |
+                                       ES_AUTOVSCROLL,
+                                   0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(ID_INFO_BODY),
+                                   nullptr, nullptr);
+        gInfo.btnOpen = CreateWindowW(L"BUTTON", L"打开所在目录",
+                                      style | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd,
+                                      reinterpret_cast<HMENU>(ID_INFO_OPEN), nullptr, nullptr);
+        gInfo.btnClose = CreateWindowW(L"BUTTON", L"关闭",
+                                       style | WS_TABSTOP | BS_DEFPUSHBUTTON, 0, 0, 0, 0, hwnd,
+                                       reinterpret_cast<HMENU>(ID_INFO_CLOSE), nullptr, nullptr);
+        ApplyInfoFonts();
+        SetWindowTextW(gInfo.body, gInfo.report.c_str());
+        SendMessageW(gInfo.body, EM_SETSEL, 0, 0);
+        SendMessageW(gInfo.body, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                     MAKELPARAM(S(8), S(8)));
+        if (gInfo.openTarget.empty()) EnableWindow(gInfo.btnOpen, FALSE);
+        LayoutInfoDialog();
+        return 0;
+    }
+
+    case WM_SIZE:
+        LayoutInfoDialog();
+        return 0;
+
+    case WM_COMMAND: {
+        const int id = LOWORD(wp);
+        if (id == ID_INFO_OPEN && !gInfo.openTarget.empty()) {
+            const std::wstring arguments = L"\"" + gInfo.openTarget + L"\"";
+            ShellExecuteW(hwnd, L"open", L"explorer.exe", arguments.c_str(), nullptr,
+                          SW_SHOWNORMAL);
+        } else if (id == ID_INFO_CLOSE || id == IDCANCEL || id == IDOK) {
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    }
+
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = reinterpret_cast<HDC>(wp);
+        HWND control = reinterpret_cast<HWND>(lp);
+        if (control == gInfo.body) {
+            SetBkColor(dc, GetSysColor(COLOR_WINDOW));
+            SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
+            return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
+        }
+        SetBkMode(dc, TRANSPARENT);
+        if (control == gInfo.badge) {
+            SetTextColor(dc, gInfo.caution ? RGB(0xB2, 0x51, 0x0B) : RGB(0x1A, 0x70, 0x3B));
+        } else {
+            SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
+        }
+        return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
+    }
+
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+
+    case WM_DESTROY:
+        if (gInfo.font) DeleteObject(gInfo.font);
+        if (gInfo.fontBold) DeleteObject(gInfo.fontBold);
+        gInfo.font = nullptr;
+        gInfo.fontBold = nullptr;
+        gInfo.hwnd = nullptr;
+        gInfo.closed = true;
+        return 0;
+
+    default:
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+void ShowConsequenceDialog(HWND parent, int entry) {
+    if (gInfo.hwnd) {
+        SetForegroundWindow(gInfo.hwnd);
+        return;
+    }
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc = InfoWndProc;
+        wc.hInstance = g.instance;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        wc.lpszClassName = L"ClearCInfoWindow";
+        wc.hIcon = g.icon;
+        wc.hIconSm = g.iconSm;
+        registered = RegisterClassExW(&wc) != 0;
+        if (!registered) return;
+    }
+
+    const EntryDef& def = Defs()[entry];
+    gInfo = InfoDialogState{};
+    gInfo.titleText = def.name;
+    gInfo.caution = def.risk == Risk::Caution;
+    gInfo.badgeText = std::wstring(L"风险：") +
+                      (gInfo.caution ? L"谨慎项 · 默认不勾选 · 请确认后再清理"
+                                     : L"安全项 · 默认勾选 · 可自动重建");
+    if (def.needsAdmin) gInfo.badgeText += L" · 需要管理员";
+    gInfo.report = BuildConsequenceReport(entry);
+    std::wstring target;
+    if (ResolveOpenTarget(entry, &target)) gInfo.openTarget = target;
+
+    RECT work = WorkAreaFor(parent);
+    const int workLeft = static_cast<int>(work.left);
+    const int workTop = static_cast<int>(work.top);
+    const int workW = static_cast<int>(work.right - work.left);
+    const int workH = static_cast<int>(work.bottom - work.top);
+    const int clientW = std::min(S(kInfoWidth), workW - S(24));
+    const int clientH = std::min(S(kInfoHeight), workH - S(48));
+    RECT rc = {0, 0, clientW, clientH};
+    AdjustWindowRectEx(&rc, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
+    const int totalW = static_cast<int>(rc.right - rc.left);
+    const int totalH = static_cast<int>(rc.bottom - rc.top);
+
+    RECT owner = {};
+    GetWindowRect(parent, &owner);
+    int x = static_cast<int>(owner.left) +
+            (static_cast<int>(owner.right - owner.left) - totalW) / 2;
+    int y = static_cast<int>(owner.top) +
+            (static_cast<int>(owner.bottom - owner.top) - totalH) / 2;
+    x = std::clamp(x, workLeft, std::max(workLeft, workLeft + workW - totalW));
+    y = std::clamp(y, workTop, std::max(workTop, workTop + workH - totalH));
+
+    const std::wstring title = std::wstring(L"清理后果说明 - ") + def.name;
+    HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ClearCInfoWindow", title.c_str(),
+                                WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPSIBLINGS, x, y,
+                                totalW, totalH, parent, nullptr, g.instance, nullptr);
+    if (!hwnd) return;
+
+    EnableWindow(parent, FALSE);
+    ShowWindow(hwnd, SW_SHOW);
+    SetFocus(gInfo.btnClose);
+
+    MSG message = {};
+    while (!gInfo.closed && GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if (IsDialogMessageW(hwnd, &message)) continue;
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+    EnableWindow(parent, TRUE);
+    SetForegroundWindow(parent);
+}
+
+// 点击是否落在第一列「名称」文字区域（排除复选框，避免勾选时误弹窗）
+bool IsNameArea(int row, int subItem, POINT pt) {
+    if (row < 0 || subItem != 0) return false;
+    int left = S(20);
+    RECT icon = {};
+    if (ListView_GetItemRect(g.list, row, &icon, LVIR_ICON)) {
+        left = std::max(left, static_cast<int>(icon.right) + S(2));
+    }
+    const int right = ListView_GetColumnWidth(g.list, 0);
+    return pt.x >= left && pt.x <= right;
 }
 
 // ════════════════════════════════════════
@@ -605,13 +938,13 @@ void LayoutControls() {
 
     LVCOLUMNW column = {};
     column.mask = LVCF_WIDTH;
-    column.cx = S(230);
+    column.cx = S(250);
     ListView_SetColumn(g.list, 0, &column);
     column.cx = S(140);
     ListView_SetColumn(g.list, 1, &column);
     column.cx = S(110);
     ListView_SetColumn(g.list, 2, &column);
-    int pathWidth = w - 2 * pad - S(480) - S(24);
+    int pathWidth = w - 2 * pad - S(500) - S(24);
     column.cx = pathWidth > S(120) ? pathWidth : S(120);
     ListView_SetColumn(g.list, 3, &column);
 }
@@ -660,8 +993,8 @@ void CreateControls(HWND hwnd) {
 
     LVCOLUMNW column = {};
     column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
-    column.pszText = const_cast<wchar_t*>(L"缓存项");
-    column.cx = S(230);
+    column.pszText = const_cast<wchar_t*>(L"缓存项（点击查看清理后果）");
+    column.cx = S(250);
     column.iSubItem = 0;
     ListView_InsertColumn(g.list, 0, &column);
     column.pszText = const_cast<wchar_t*>(L"分类");
@@ -765,6 +1098,35 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
 
+    case WM_SETCURSOR:
+        // 鼠标悬停在名称上时显示手型，提示可点击
+        if (reinterpret_cast<HWND>(wp) == g.list && LOWORD(lp) == HTCLIENT) {
+            POINT pt = {};
+            GetCursorPos(&pt);
+            ScreenToClient(g.list, &pt);
+            LVHITTESTINFO hit = {};
+            hit.pt = pt;
+            const int row = static_cast<int>(
+                SendMessageW(g.list, LVM_HITTEST, 0, reinterpret_cast<LPARAM>(&hit)));
+            if (IsNameArea(row, hit.iSubItem, pt) && g.handCursor) {
+                SetCursor(g.handCursor);
+                return TRUE;
+            }
+        }
+        break;
+
+    case WM_TIMER:
+        if (wp == kClickTimerId) {
+            KillTimer(hwnd, kClickTimerId);
+            const int row = g.pendingNameRow;
+            g.pendingNameRow = -1;
+            if (row >= 0 && row < static_cast<int>(g.visible.size())) {
+                ShowConsequenceDialog(hwnd, g.visible[static_cast<std::size_t>(row)]);
+            }
+            return 0;
+        }
+        break;
+
     case WM_CTLCOLORSTATIC: {
         HDC dc = reinterpret_cast<HDC>(wp);
         SetBkMode(dc, TRANSPARENT);
@@ -826,7 +1188,34 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     }
                 }
             }
+        } else if (header->code == NM_CUSTOMDRAW) {
+            auto* draw = reinterpret_cast<NMLVCUSTOMDRAW*>(lp);
+            LRESULT result = CDRF_DODEFAULT;
+            if (draw->nmcd.dwDrawStage == CDDS_PREPAINT) {
+                result = CDRF_NOTIFYITEMDRAW;
+            } else if (draw->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
+                result = CDRF_NOTIFYSUBITEMDRAW;
+            } else if (draw->nmcd.dwDrawStage == (CDDS_ITEMPREPAINT | CDDS_SUBITEM) &&
+                       draw->iSubItem == 0 && !(draw->nmcd.uItemState & CDIS_SELECTED)) {
+                // 名称显示为蓝色下划线链接，提示可点击查看清理后果
+                if (g.fontLink) SelectObject(draw->nmcd.hdc, g.fontLink);
+                draw->clrText = RGB(0x00, 0x5A, 0xD9);
+                result = CDRF_NEWFONT;
+            }
+            return result;
+        } else if (header->code == NM_CLICK) {
+            auto* activate = reinterpret_cast<NMITEMACTIVATE*>(lp);
+            if (IsNameArea(activate->iItem, activate->iSubItem, activate->ptAction)) {
+                // 延时到双击时间窗结束，避免与「双击打开目录」冲突
+                g.pendingNameRow = activate->iItem;
+                SetTimer(hwnd, kClickTimerId, GetDoubleClickTime(), nullptr);
+            } else {
+                g.pendingNameRow = -1;
+                KillTimer(hwnd, kClickTimerId);
+            }
         } else if (header->code == NM_DBLCLK) {
+            KillTimer(hwnd, kClickTimerId);
+            g.pendingNameRow = -1;
             auto* activate = reinterpret_cast<NMITEMACTIVATE*>(lp);
             const int row = activate->iItem;
             if (row >= 0 && row < static_cast<int>(g.visible.size())) {
@@ -913,10 +1302,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_DESTROY:
         g.cancel = true;
+        KillTimer(hwnd, kClickTimerId);
         StopThread(&g.scanThread, 3000);
         StopThread(&g.cleanThread, 3000);
         if (g.font) DeleteObject(g.font);
         if (g.fontBold) DeleteObject(g.fontBold);
+        if (g.fontLink) DeleteObject(g.fontLink);
         if (g.icon) DestroyIcon(g.icon);
         if (g.iconSm) DestroyIcon(g.iconSm);
         PostQuitMessage(0);
@@ -947,6 +1338,8 @@ int RunGui(HINSTANCE instance, int showCmd) {
     g.iconSm = reinterpret_cast<HICON>(LoadImageW(
         instance, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
         GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
+    // IDC_HAND = 32649，直接用资源 ID 避免不同 SDK 头文件下的宏定义差异
+    g.handCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32649));
 
     const wchar_t* className = L"ClearCMainWindow";
     WNDCLASSEXW windowClass = {};

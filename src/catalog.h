@@ -46,12 +46,14 @@ struct EntryDef {
     bool needsAdmin;
     bool defaultChecked;
     Risk risk;
-    const wchar_t* note;
+    const wchar_t* note;          // 一句话说明这是什么缓存
+    const wchar_t* consequence;   // 清理之后会发生什么（点击名称时展示）
     EntryKind kind;
 };
 
 const EntryDef* Catalog(std::size_t* count);
 const wchar_t* CategoryName(Category category);
+const wchar_t* ConsequenceOf(const EntryDef& def);
 
 // 解析所有清理项：展开环境变量/通配、剔除不存在或不安全的目标
 std::vector<EntryState> ResolveCatalog(bool elevated);
